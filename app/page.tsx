@@ -52,7 +52,9 @@ export default function BugsAndBrews() {
     link.href =
       "https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Space+Mono:wght@400;700&display=swap";
     document.head.appendChild(link);
-    return () => document.head.removeChild(link);
+    return () => {
+      document.head.removeChild(link);
+    };
   }, []);
 
   // Pick a RANDOM song (never the same one twice in a row) and start spinning
@@ -173,7 +175,7 @@ export default function BugsAndBrews() {
         </button>
 
         <p style={styles.counter}>
-          {song ? `track ${current + 1} of ${SONGS.length}` : `${SONGS.length} tracks loaded`}
+          {current !== null ? `track ${current + 1} of ${SONGS.length}` : `${SONGS.length} tracks loaded`}
         </p>
       </main>
     </div>
