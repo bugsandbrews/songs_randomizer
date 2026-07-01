@@ -1,16 +1,22 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { CSSProperties } from "react";
 
-// ── Our placeholder songs (just title + artist for now) ──────────────
-const SONGS = [
-  { title: "Neon Cassette",      artist: "The Bedroom Astronauts" },
-  { title: "Sidewalk Disco",     artist: "Plum & the Pavement" },
-  { title: "Slow Motion Sunday", artist: "Cassette Coast" },
-  { title: "Bug in the System",  artist: "Static Bloom" },
-  { title: "Brewed Too Strong",  artist: "The Overcaffeinated" },
-  { title: "Midnight Mixtape",   artist: "Velvet Static" },
+// A song we've fetched from the iTunes Search API, trimmed down to just
+// what the cassette UI needs.
+type Song = {
+  title: string;
+  artist: string;
+  artwork: string;
+  previewUrl: string;
+};
+
+// Everyday words we feed into the iTunes search so every "Play" press
+// turns up something different — a cheap way to fake "shuffle the crate".
+const SEARCH_TERMS = [
+  "love", "night", "dream", "summer", "heart", "sunshine", "rain",
+  "dance", "blue", "gold", "wonder", "home", "wild", "sweet", "electric",
 ];
 
 // A few playful colors we reuse everywhere
@@ -25,25 +31,53 @@ const C = {
   cream:    "#FFF6E9",
 };
 
-// Pre-build the falling confetti + flower "rain" pieces (random positions/speeds)
-const RAIN = Array.from({ length: 42 }).map((_, i) => {
-  const isFlower = i % 3 === 0;
-  return {
-    id: i,
-    isFlower,
-    left: Math.round(Math.random() * 100),
-    delay: +(Math.random() * 8).toFixed(2),
-    duration: +(7 + Math.random() * 7).toFixed(2),
-    size: isFlower ? 12 + Math.round(Math.random() * 6) : 6 + Math.round(Math.random() * 6),
-    drift: Math.round(Math.random() * 60 - 30),
-    color: [C.sun, C.pink, C.cyan, C.tomato, C.grape][i % 5],
-  };
-});
+type RainPiece = {
+  id: number;
+  isFlower: boolean;
+  left: number;
+  delay: number;
+  duration: number;
+  size: number;
+  drift: number;
+  color: string;
+};
+
+// Build the falling confetti + flower "rain" pieces (random positions/speeds).
+// Called only on the client, after mount, so the server-rendered HTML never
+// contains these random values (see the useEffect below for why).
+function generateRain(): RainPiece[] {
+  return Array.from({ length: 42 }).map((_, i) => {
+    const isFlower = i % 3 === 0;
+    return {
+      id: i,
+      isFlower,
+      left: Math.round(Math.random() * 100),
+      delay: +(Math.random() * 8).toFixed(2),
+      duration: +(7 + Math.random() * 7).toFixed(2),
+      size: isFlower ? 12 + Math.round(Math.random() * 6) : 6 + Math.round(Math.random() * 6),
+      drift: Math.round(Math.random() * 60 - 30),
+      color: [C.sun, C.pink, C.cyan, C.tomato, C.grape][i % 5],
+    };
+  });
+}
 
 export default function BugsAndBrews() {
-  // Which song is showing right now (null = nothing played yet)
-  const [current, setCurrent] = useState<number | null>(null);
+  // The song currently loaded on the "tape" (null = nothing played yet)
+  const [song, setSong] = useState<Song | null>(null);
   const [playing, setPlaying] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Start with no rain pieces (matches the server-rendered HTML exactly),
+  // then fill them in with random values once we're safely on the client.
+  const [rain, setRain] = useState<RainPiece[]>([]);
+  useEffect(() => {
+    setRain(generateRain());
+  }, []);
+
+  // The actual audio playback happens through this hidden <audio> element —
+  // we just point its `src` at the preview clip and call play()/pause().
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // Load two characterful fonts: a chunky display face + a typewriter mono
   useEffect(() => {
@@ -57,17 +91,78 @@ export default function BugsAndBrews() {
     };
   }, []);
 
-  // Pick a RANDOM song (never the same one twice in a row) and start spinning
-  function discover() {
-    let next = Math.floor(Math.random() * SONGS.length);
-    while (current !== null && next === current && SONGS.length > 1) {
-      next = Math.floor(Math.random() * SONGS.length);
-    }
-    setCurrent(next);
-    setPlaying(true);
+  // Ask the iTunes Search API for a batch of songs matching a random word,
+  // then keep only the ones that actually have a 30-second preview clip.
+  async function fetchRandomSong(): Promise<Song> {
+    const term = SEARCH_TERMS[Math.floor(Math.random() * SEARCH_TERMS.length)];
+    const url = `https://itunes.apple.com/search?media=music&limit=50&term=${encodeURIComponent(term)}`;
+
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("iTunes search request failed");
+
+    const data = await res.json();
+    const candidates = (data.results ?? []).filter(
+      (r: { previewUrl?: string; trackName?: string; artistName?: string }) =>
+        r.previewUrl && r.trackName && r.artistName
+    );
+    if (candidates.length === 0) throw new Error("No previewable tracks found");
+
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    return {
+      title: pick.trackName,
+      artist: pick.artistName,
+      // iTunes gives us a tiny 100x100 thumbnail by default — swap it for
+      // the larger 300x300 version so the artwork isn't blurry.
+      artwork: (pick.artworkUrl100 ?? "").replace("100x100", "300x300"),
+      previewUrl: pick.previewUrl,
+    };
   }
 
-  const song = current === null ? null : SONGS[current];
+  // Fetch a brand new random song and start playing it.
+  async function discover() {
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await fetchRandomSong();
+      setSong(next);
+      setPlaying(true);
+    } catch {
+      setError("Couldn't reach the mixtape shelf — check your connection and try again.");
+      setPlaying(false);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // The big button: first press fetches+plays a song, later presses just
+  // toggle play/pause on the track that's already loaded.
+  function togglePlay() {
+    if (!song) {
+      discover();
+      return;
+    }
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (playing) {
+      audio.pause();
+      setPlaying(false);
+    } else {
+      audio.play().catch(() => setError("Tap play again to start the preview."));
+      setPlaying(true);
+    }
+  }
+
+  // Whenever we load a new song, point the <audio> element at its preview
+  // clip and start playing.
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !song) return;
+    audio.src = song.previewUrl;
+    audio.play().catch(() => {
+      setError("Tap play again to start the preview.");
+      setPlaying(false);
+    });
+  }, [song]);
 
   return (
     <div style={styles.page}>
@@ -75,7 +170,7 @@ export default function BugsAndBrews() {
 
       {/* Falling confetti + flowers drifting down the background */}
       <div style={styles.rainLayer} aria-hidden="true">
-        {RAIN.map((p) =>
+        {rain.map((p) =>
           p.isFlower ? (
             <span
               key={p.id}
@@ -126,16 +221,27 @@ export default function BugsAndBrews() {
         {/* ── THE CASSETTE (the centerpiece) ── */}
         <div className="cassette" style={styles.cassette}>
           {/* Label strip — re-keyed so it pops each time the song changes */}
-          <div key={current ?? "idle"} className="label-pop" style={styles.label}>
+          <div key={song?.previewUrl ?? "idle"} className="label-pop" style={styles.label}>
             {song ? (
+              <div style={styles.labelRow}>
+                {song.artwork && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={song.artwork} alt="" style={styles.artwork} />
+                )}
+                <div style={styles.labelText}>
+                  <div style={styles.labelTitle}>{song.title}</div>
+                  <div style={styles.labelArtist}>by {song.artist}</div>
+                </div>
+              </div>
+            ) : error ? (
               <>
-                <div style={styles.labelTitle}>{song.title}</div>
-                <div style={styles.labelArtist}>by {song.artist}</div>
+                <div style={styles.labelTitle}>⚠ {error}</div>
+                <div style={styles.labelArtist}>tap play to try again</div>
               </>
             ) : (
               <>
-                <div style={styles.labelTitle}>▷ PRESS PLAY</div>
-                <div style={styles.labelArtist}>your mixtape awaits</div>
+                <div style={styles.labelTitle}>{loading ? "▷ FINDING A TRACK…" : "▷ PRESS PLAY"}</div>
+                <div style={styles.labelArtist}>{loading ? "hang tight" : "your mixtape awaits"}</div>
               </>
             )}
           </div>
@@ -169,14 +275,36 @@ export default function BugsAndBrews() {
         </div>
 
         {/* ── THE BIG PLAY BUTTON ── */}
-        <button className="play-btn" style={styles.play} onClick={discover}>
-          <span style={styles.playIcon}>{current === null ? "▶" : "↻"}</span>
-          {current === null ? "Play" : "Next track"}
+        <button
+          className="play-btn"
+          style={{ ...styles.play, opacity: loading ? 0.65 : 1, cursor: loading ? "wait" : "pointer" }}
+          onClick={togglePlay}
+          disabled={loading}
+        >
+          <span style={styles.playIcon}>
+            {loading ? "⋯" : song ? (playing ? "❚❚" : "▶") : "▶"}
+          </span>
+          {loading ? "Loading" : song ? (playing ? "Pause" : "Resume") : "Play"}
         </button>
 
+        {/* Grab a different random song without leaving the current one paused forever */}
+        {song && (
+          <button
+            className="shuffle-btn"
+            style={{ ...styles.shuffle, opacity: loading ? 0.65 : 1, cursor: loading ? "wait" : "pointer" }}
+            onClick={discover}
+            disabled={loading}
+          >
+            🔀 Next track
+          </button>
+        )}
+
         <p style={styles.counter}>
-          {current !== null ? `track ${current + 1} of ${SONGS.length}` : `${SONGS.length} tracks loaded`}
+          {loading ? "shuffling the iTunes crate…" : song ? "fresh from the iTunes catalog" : "tap play for a surprise pick"}
         </p>
+
+        {/* Hidden audio element — this is what actually plays the 30s preview */}
+        <audio ref={audioRef} onEnded={() => setPlaying(false)} />
       </main>
     </div>
   );
@@ -280,6 +408,16 @@ const styles: Record<string, CSSProperties> = {
     padding: "12px 14px",
     marginBottom: 18,
   },
+  labelRow: { display: "flex", alignItems: "center", gap: 12, textAlign: "left" },
+  labelText: { minWidth: 0 },
+  artwork: {
+    width: 56,
+    height: 56,
+    borderRadius: 8,
+    border: `3px solid ${C.ink}`,
+    objectFit: "cover",
+    flexShrink: 0,
+  },
   labelTitle: {
     fontFamily: "'Space Mono', ui-monospace, monospace",
     fontWeight: 700,
@@ -341,6 +479,19 @@ const styles: Record<string, CSSProperties> = {
     boxShadow: `7px 7px 0 ${C.ink}`,
   },
   playIcon: { fontSize: 22 },
+  shuffle: {
+    marginTop: 14,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontWeight: 700,
+    fontSize: 15,
+    color: C.ink,
+    background: C.cyan,
+    border: `4px solid ${C.ink}`,
+    borderRadius: 999,
+    padding: "8px 20px",
+    boxShadow: `4px 4px 0 ${C.ink}`,
+  },
   counter: {
     fontFamily: "'Space Mono', ui-monospace, monospace",
     fontSize: 13,
@@ -374,6 +525,11 @@ const css = `
   .play-btn:hover  { transform: translate(2px, 2px); box-shadow: 5px 5px 0 ${C.ink}; }
   .play-btn:active { transform: translate(7px, 7px); box-shadow: 0 0 0 ${C.ink}; }
   .play-btn:focus-visible { outline: 4px solid ${C.cyan}; outline-offset: 4px; }
+
+  .shuffle-btn { transition: transform .06s ease, box-shadow .06s ease; }
+  .shuffle-btn:hover  { transform: translate(2px, 2px); box-shadow: 2px 2px 0 ${C.ink}; }
+  .shuffle-btn:active { transform: translate(4px, 4px); box-shadow: 0 0 0 ${C.ink}; }
+  .shuffle-btn:focus-visible { outline: 4px solid ${C.pink}; outline-offset: 4px; }
 
   @media (prefers-reduced-motion: reduce) {
     .reel-spin, .label-pop, .eq-bar, .rain-piece { animation: none !important; }
