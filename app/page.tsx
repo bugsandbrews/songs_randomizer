@@ -10,7 +10,20 @@ type Song = {
   artist: string;
   artwork: string;
   previewUrl: string;
+  genre?: string;
 };
+
+// Fixed burst positions for the related-track tiles, offset in % relative
+// to the cassette so they "spill out" to either side regardless of screen
+// size. --rot is read by the tileIn keyframe below.
+const RELATED_LAYOUT: Array<{ top: string; left?: string; right?: string; rotate: number }> = [
+  { top: "-8%",  left: "-12%",  rotate: -12 },
+  { top: "30%",  left: "-18%",  rotate: 9 },
+  { top: "68%",  left: "-10%",  rotate: -7 },
+  { top: "-8%",  right: "-12%", rotate: 12 },
+  { top: "30%",  right: "-18%", rotate: -9 },
+  { top: "68%",  right: "-10%", rotate: 7 },
+];
 
 // Everyday words we feed into the iTunes search so every "Play" press
 // turns up something different — a cheap way to fake "shuffle the crate".
@@ -68,6 +81,11 @@ export default function BugsAndBrews() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Tracks from the same artist/genre, radiating around the cassette.
+  // Starts empty on both server and client, so it never causes a hydration
+  // mismatch — it only ever fills in from client-side fetches after mount.
+  const [related, setRelated] = useState<Song[]>([]);
+
   // Start with no rain pieces (matches the server-rendered HTML exactly),
   // then fill them in with random values once we're safely on the client.
   const [rain, setRain] = useState<RainPiece[]>([]);
@@ -115,7 +133,51 @@ export default function BugsAndBrews() {
       // the larger 300x300 version so the artwork isn't blurry.
       artwork: (pick.artworkUrl100 ?? "").replace("100x100", "300x300"),
       previewUrl: pick.previewUrl,
+      genre: pick.primaryGenreName,
     };
+  }
+
+  // Ask iTunes for a handful of tracks from the same artist, topping up
+  // with same-genre tracks if the artist alone doesn't have enough previews.
+  // Best-effort: any network hiccup just means no tiles show up.
+  async function fetchRelatedSongs(current: Song): Promise<Song[]> {
+    const seen = new Set<string>([current.previewUrl]);
+    const pool: Song[] = [];
+
+    const search = async (term: string) => {
+      const url = `https://itunes.apple.com/search?media=music&entity=song&limit=25&term=${encodeURIComponent(term)}`;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const data = await res.json();
+        const results = (data.results ?? []) as Array<{
+          previewUrl?: string;
+          trackName?: string;
+          artistName?: string;
+          artworkUrl100?: string;
+          primaryGenreName?: string;
+        }>;
+        for (const r of results) {
+          if (pool.length >= 6) return;
+          if (!r.previewUrl || !r.trackName || !r.artistName || seen.has(r.previewUrl)) continue;
+          seen.add(r.previewUrl);
+          pool.push({
+            title: r.trackName,
+            artist: r.artistName,
+            artwork: (r.artworkUrl100 ?? "").replace("100x100", "300x300"),
+            previewUrl: r.previewUrl,
+            genre: r.primaryGenreName,
+          });
+        }
+      } catch {
+        // network hiccup — related tiles just won't show up this time
+      }
+    };
+
+    await search(current.artist);
+    if (pool.length < 6 && current.genre) await search(current.genre);
+
+    return pool.sort(() => Math.random() - 0.5).slice(0, 6);
   }
 
   // Fetch a brand new random song and start playing it.
@@ -163,6 +225,26 @@ export default function BugsAndBrews() {
       setPlaying(false);
     });
   }, [song]);
+
+  // Whenever the loaded song changes, go find some neighbors for it. Only
+  // fires when `song` itself changes (a new track), not on play/pause toggles.
+  useEffect(() => {
+    if (!song) return;
+    let cancelled = false;
+    fetchRelatedSongs(song).then((list) => {
+      if (!cancelled) setRelated(list);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [song]);
+
+  // Clicking a related tile swaps it in as the now-playing track.
+  function playRelated(picked: Song) {
+    setError(null);
+    setSong(picked);
+    setPlaying(true);
+  }
 
   return (
     <div style={styles.page}>
@@ -218,59 +300,86 @@ export default function BugsAndBrews() {
           Press play. Meet your <span style={styles.taglineHi}>next favorite song.</span>
         </p>
 
-        {/* ── THE CASSETTE (the centerpiece) ── */}
-        <div className="cassette" style={styles.cassette}>
-          {/* Label strip — re-keyed so it pops each time the song changes */}
-          <div key={song?.previewUrl ?? "idle"} className="label-pop" style={styles.label}>
-            {song ? (
-              <div style={styles.labelRow}>
-                {song.artwork && (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={song.artwork} alt="" style={styles.artwork} />
-                )}
-                <div style={styles.labelText}>
-                  <div style={styles.labelTitle}>{song.title}</div>
-                  <div style={styles.labelArtist}>by {song.artist}</div>
+        {/* ── THE CASSETTE (the centerpiece), with related tracks spilling
+             out around it once a song is playing ── */}
+        <div style={styles.cassetteWrap}>
+          {(song ? related : []).map((r, i) => {
+            const pos = RELATED_LAYOUT[i % RELATED_LAYOUT.length];
+            return (
+              <button
+                key={r.previewUrl}
+                type="button"
+                className="related-tile"
+                onClick={() => playRelated(r)}
+                title={`${r.title} — ${r.artist}`}
+                aria-label={`Play ${r.title} by ${r.artist}`}
+                style={{
+                  ...styles.relatedTile,
+                  top: pos.top,
+                  left: pos.left,
+                  right: pos.right,
+                  ["--rot"]: `${pos.rotate}deg`,
+                } as CSSProperties}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={r.artwork} alt="" style={styles.relatedArt} />
+              </button>
+            );
+          })}
+
+          <div className="cassette" style={styles.cassette}>
+            {/* Label strip — re-keyed so it pops each time the song changes */}
+            <div key={song?.previewUrl ?? "idle"} className="label-pop" style={styles.label}>
+              {song ? (
+                <div style={styles.labelRow}>
+                  {song.artwork && (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={song.artwork} alt="" style={styles.artwork} />
+                  )}
+                  <div style={styles.labelText}>
+                    <div style={styles.labelTitle}>{song.title}</div>
+                    <div style={styles.labelArtist}>by {song.artist}</div>
+                  </div>
+                </div>
+              ) : error ? (
+                <>
+                  <div style={styles.labelTitle}>⚠ {error}</div>
+                  <div style={styles.labelArtist}>tap play to try again</div>
+                </>
+              ) : (
+                <>
+                  <div style={styles.labelTitle}>{loading ? "▷ FINDING A TRACK…" : "▷ PRESS PLAY"}</div>
+                  <div style={styles.labelArtist}>{loading ? "hang tight" : "your mixtape awaits"}</div>
+                </>
+              )}
+            </div>
+
+            {/* The two daisy reels + the tape window between them */}
+            <div style={styles.reelRow}>
+              <Reel spinning={playing} />
+              <div style={styles.window}>
+                <div style={styles.tape} />
+                {/* tiny equalizer bars, only when playing */}
+                <div style={styles.eq}>
+                  {[0, 1, 2, 3, 4].map((i) => (
+                    <span
+                      key={i}
+                      className={playing ? "eq-bar" : ""}
+                      style={{
+                        ...styles.eqBar,
+                        animationDelay: `${i * 0.12}s`,
+                        height: playing ? undefined : 6,
+                      }}
+                    />
+                  ))}
                 </div>
               </div>
-            ) : error ? (
-              <>
-                <div style={styles.labelTitle}>⚠ {error}</div>
-                <div style={styles.labelArtist}>tap play to try again</div>
-              </>
-            ) : (
-              <>
-                <div style={styles.labelTitle}>{loading ? "▷ FINDING A TRACK…" : "▷ PRESS PLAY"}</div>
-                <div style={styles.labelArtist}>{loading ? "hang tight" : "your mixtape awaits"}</div>
-              </>
-            )}
-          </div>
-
-          {/* The two daisy reels + the tape window between them */}
-          <div style={styles.reelRow}>
-            <Reel spinning={playing} />
-            <div style={styles.window}>
-              <div style={styles.tape} />
-              {/* tiny equalizer bars, only when playing */}
-              <div style={styles.eq}>
-                {[0, 1, 2, 3, 4].map((i) => (
-                  <span
-                    key={i}
-                    className={playing ? "eq-bar" : ""}
-                    style={{
-                      ...styles.eqBar,
-                      animationDelay: `${i * 0.12}s`,
-                      height: playing ? undefined : 6,
-                    }}
-                  />
-                ))}
-              </div>
+              <Reel spinning={playing} />
             </div>
-            <Reel spinning={playing} />
-          </div>
 
-          <div style={styles.cassetteFoot}>
-            bugsandbrews ⋆ home-brewed mixtape ⋆ TYPE II
+            <div style={styles.cassetteFoot}>
+              bugsandbrews ⋆ home-brewed mixtape ⋆ TYPE II
+            </div>
           </div>
         </div>
 
@@ -392,14 +501,37 @@ const styles: Record<string, CSSProperties> = {
   tagline: { fontSize: "clamp(16px, 3.5vw, 20px)", margin: "14px 0 28px", fontWeight: 700 },
   taglineHi: { background: C.cyan, padding: "2px 8px", borderRadius: 8, border: `3px solid ${C.ink}` },
 
-  cassette: {
+  cassetteWrap: {
+    position: "relative",
     width: "100%",
     maxWidth: 460,
+  },
+  cassette: {
+    width: "100%",
     background: C.grape,
     border: `5px solid ${C.ink}`,
     borderRadius: 22,
     boxShadow: `10px 10px 0 ${C.ink}`,
     padding: 22,
+  },
+  relatedTile: {
+    position: "absolute",
+    width: 62,
+    height: 62,
+    padding: 0,
+    border: `3px solid ${C.ink}`,
+    borderRadius: 10,
+    background: C.cream,
+    boxShadow: `4px 4px 0 ${C.ink}`,
+    overflow: "hidden",
+    cursor: "pointer",
+    zIndex: 3,
+  },
+  relatedArt: {
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
+    display: "block",
   },
   label: {
     background: C.cream,
@@ -531,7 +663,20 @@ const css = `
   .shuffle-btn:active { transform: translate(4px, 4px); box-shadow: 0 0 0 ${C.ink}; }
   .shuffle-btn:focus-visible { outline: 4px solid ${C.pink}; outline-offset: 4px; }
 
+  @keyframes tileIn {
+    from { opacity: 0; transform: rotate(var(--rot, 0deg)) scale(0.8); }
+    to   { opacity: 1; transform: rotate(var(--rot, 0deg)) scale(1); }
+  }
+  .related-tile {
+    transform: rotate(var(--rot, 0deg));
+    animation: tileIn 0.3s ease-out backwards;
+    transition: box-shadow .12s ease, filter .12s ease;
+  }
+  .related-tile:hover  { box-shadow: 6px 6px 0 ${C.ink}; filter: brightness(1.08); }
+  .related-tile:active { box-shadow: 1px 1px 0 ${C.ink}; }
+  .related-tile:focus-visible { outline: 3px solid ${C.cyan}; outline-offset: 3px; }
+
   @media (prefers-reduced-motion: reduce) {
-    .reel-spin, .label-pop, .eq-bar, .rain-piece { animation: none !important; }
+    .reel-spin, .label-pop, .eq-bar, .rain-piece, .related-tile { animation: none !important; }
   }
 `;
